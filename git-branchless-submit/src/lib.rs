@@ -109,15 +109,23 @@ pub struct SubmitOptions {
 
 /// The result of creating a commit.
 #[derive(Clone, Debug)]
-pub struct CreateStatus {
-    /// The commit OID after carrying out the creation process. Usually, this
-    /// will be the same as the original commit OID, unless the forge amends it
-    /// (e.g. to include a change ID).
-    pub final_commit_oid: NonZeroOid,
+pub enum CreateStatus {
+    Created {
+        /// The commit OID after carrying out the creation process. Usually, this
+        /// will be the same as the original commit OID, unless the forge amends it
+        /// (e.g. to include a change ID).
+        final_commit_oid: NonZeroOid,
 
-    /// The local branch name to use. The caller will try to create the branch
-    /// pointing to that commit (assuming that it doesn't already exist).
-    pub local_branch_name: String,
+        /// The local branch name to use. The caller will try to create the branch
+        /// pointing to that commit (assuming that it doesn't already exist).
+        local_branch_name: String,
+    },
+    Skipped {
+        commit_oid: NonZeroOid,
+    },
+    Err {
+        commit_oid: NonZeroOid,
+    },
 }
 
 /// "Forge" refers to a Git hosting provider, such as GitHub, GitLab, etc.
@@ -325,7 +333,11 @@ fn submit(
         (unsubmitted, to_update, to_skip)
     });
 
-    let (created_branches, uncreated_branches): (BTreeSet<String>, BTreeSet<String>) = {
+    let (created_branches, uncreated_branches, create_error_commits): (
+        BTreeSet<String>,
+        BTreeSet<String>,
+        BTreeSet<NonZeroOid>,
+    ) = {
         let unsubmitted_branches = unsubmitted_commits
             .values()
             .flat_map(|commit_status| commit_status.local_branch_name.clone())
@@ -333,7 +345,7 @@ fn submit(
         if unsubmitted_commits.is_empty() {
             Default::default()
         } else if create && dry_run {
-            (unsubmitted_branches, Default::default())
+            (unsubmitted_branches, Default::default(), Default::default())
         } else if create {
             let create_statuses =
                 try_exit_code!(forge.create(unsubmitted_commits, &submit_options)?);
@@ -343,26 +355,37 @@ fn submit(
                 .flatten()
                 .collect();
             let mut created_branches = BTreeSet::new();
+            let mut error_commits = BTreeSet::new();
             for (_commit_oid, create_status) in create_statuses {
-                let CreateStatus {
-                    final_commit_oid,
-                    local_branch_name,
-                } = create_status;
-                let branch_reference_name =
-                    ReferenceName::from(format!("refs/heads/{local_branch_name}"));
-                created_branches.insert(local_branch_name);
-                if !all_branches.contains(&branch_reference_name) {
-                    repo.create_reference(
-                        &branch_reference_name,
+                match create_status {
+                    CreateStatus::Created {
                         final_commit_oid,
-                        false,
-                        "submit",
-                    )?;
+                        local_branch_name,
+                    } => {
+                        let branch_reference_name =
+                            ReferenceName::from(format!("refs/heads/{local_branch_name}"));
+                        created_branches.insert(local_branch_name);
+                        if !all_branches.contains(&branch_reference_name) {
+                            repo.create_reference(
+                                &branch_reference_name,
+                                final_commit_oid,
+                                false,
+                                "submit",
+                            )?;
+                        }
+                    }
+                    // For now, treat `Skipped` the same as `Err` as it would be
+                    // a lot of work to render it differently in the output, and
+                    // we may want to rethink the data structures before doing
+                    // that.
+                    CreateStatus::Skipped { commit_oid } | CreateStatus::Err { commit_oid } => {
+                        error_commits.insert(commit_oid);
+                    }
                 }
             }
-            (created_branches, Default::default())
+            (created_branches, Default::default(), error_commits)
         } else {
-            (Default::default(), unsubmitted_branches)
+            (Default::default(), unsubmitted_branches, Default::default())
         }
     };
 
@@ -482,8 +505,33 @@ create and push them, retry this operation with the --create option.",
             if dry_run { "are" } else { "were" },
         )?;
     }
+    if !create_error_commits.is_empty() {
+        writeln!(
+            effects.get_output_stream(),
+            "Failed to create {}:",
+            Pluralize {
+                determiner: None,
+                amount: create_error_commits.len(),
+                unit: ("commit", "commits")
+            },
+        )?;
+        for error_commit_oid in &create_error_commits {
+            let error_commit = repo.find_commit_or_fail(*error_commit_oid)?;
+            writeln!(
+                effects.get_output_stream(),
+                "{}",
+                effects
+                    .get_glyphs()
+                    .render(error_commit.friendly_describe(effects.get_glyphs())?)?
+            )?;
+        }
+    }
 
-    Ok(Ok(()))
+    if !create_error_commits.is_empty() {
+        Ok(Err(ExitCode(1)))
+    } else {
+        Ok(Ok(()))
+    }
 }
 
 #[instrument]
