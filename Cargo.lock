@@ -1658,6 +1658,7 @@ dependencies = [
  "git-branchless-opts",
  "git-branchless-revset",
  "git-branchless-test",
+ "indexmap 2.2.1",
  "insta",
  "itertools 0.12.1",
  "lazy_static",
@@ -1665,6 +1666,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
